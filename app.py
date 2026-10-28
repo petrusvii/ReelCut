@@ -434,20 +434,67 @@ START_AT = 0.10     # play from 10 % in, past the count-in
 
 
 class SeekBar(QSlider):
-    """Thin tape-position slider; a click jumps straight to that spot."""
+    """Small waveform of the song that doubles as the play-position slider.
+
+    Click or drag anywhere to move the position. The played part is drawn dark.
+    """
 
     def __init__(self):
         super().__init__(Qt.Horizontal)
         self.setRange(0, 1000)
         self.setValue(int(START_AT * 1000))
         self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(26)
+        self.levels = None
+
+    def set_env(self, env):
+        """env = loudness in dB per 0.5 s. Scaled between the song's own quiet and loud
+        parts, so verses, choruses and breaks stand out even after compression."""
+        if env is None or len(env) == 0:
+            self.levels = None
+        else:
+            env = np.asarray(env)
+            lo, hi = np.percentile(env, 5), np.percentile(env, 98)
+            hi = max(hi, lo + 8)                       # don't blow up tiny differences
+            self.levels = np.clip((env - lo) / (hi - lo), 0.06, 1.0) ** 1.5
+        self.update()
+
+    def _move(self, e):
+        v = QStyle.sliderValueFromPosition(self.minimum(), self.maximum(), int(e.position().x()), self.width())
+        self.setValue(v)
+        self.sliderMoved.emit(v)
 
     def mousePressEvent(self, e):
-        if e.button() == Qt.LeftButton:
-            v = QStyle.sliderValueFromPosition(self.minimum(), self.maximum(), int(e.position().x()), self.width())
-            self.setValue(v)
-            self.sliderMoved.emit(v)
-        super().mousePressEvent(e)
+        if e.button() == Qt.LeftButton and self.isEnabled():
+            self.setSliderDown(True)
+            self._move(e)
+
+    def mouseMoveEvent(self, e):
+        if self.isSliderDown():
+            self._move(e)
+
+    def mouseReleaseEvent(self, e):
+        self.setSliderDown(False)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        w, h = self.width(), self.height()
+        mid = h / 2
+        x_pos = self.value() / 1000 * w
+        played, rest = QColor("#6b4a30"), QColor("#cdbb91" if self.isEnabled() else "#e3d6b4")
+        if self.levels is None:
+            p.fillRect(QRectF(0, mid - 1, w, 2), rest)
+        else:
+            step = 3                                         # 2 px bar + 1 px gap
+            n = max(1, w // step)
+            lv = self.levels
+            edges = np.linspace(0, len(lv), n + 1).astype(int)
+            for i in range(n):
+                a, b = edges[i], max(edges[i] + 1, edges[i + 1])
+                amp = lv[a:b].max() * (mid - 1)
+                x = i * step
+                p.fillRect(QRectF(x, mid - amp, 2, amp * 2), played if x < x_pos else rest)
+        p.fillRect(QRectF(x_pos - 1.5, 0, 3, h), QColor(RED))
 
 
 class SongRow(QFrame):
@@ -475,6 +522,7 @@ class SongRow(QFrame):
         self.name.editingFinished.connect(lambda: self.renamed.emit(self, self.name.text()))
         self.dur = QLabel()
         self.dur.setObjectName("dur")
+        self.bar = SeekBar()
         self.set_span(start, end, env)
         self.b_recut = QPushButton("⟷")
         self.b_recut.setObjectName("small")
@@ -487,7 +535,6 @@ class SongRow(QFrame):
         for b in (self.b_recut, self.b_discard):
             b.setFixedSize(30, 30)
             b.setCursor(Qt.PointingHandCursor)
-        self.bar = SeekBar()
         self.bar.setToolTip("Where to listen from. Click or drag.")
         self.bar.sliderMoved.connect(lambda v: self.seek.emit(self, v / 1000))
         mid = QVBoxLayout()
@@ -503,6 +550,7 @@ class SongRow(QFrame):
 
     def set_span(self, start, end, env):
         self.start, self.end, self.env = start, end, env
+        self.bar.set_env(env)
         d = end - start
         self.dur.setText(f"{int(d // 60)}:{int(d % 60):02d}")
 

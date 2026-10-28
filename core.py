@@ -14,9 +14,9 @@ NOWINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32"
 @dataclass
 class Options:
     cut: bool = True
-    min_song_s: float = 120.0     # pieces shorter than this are skipped
+    min_song_s: float = 60.0      # pieces shorter than this are skipped
     pad_s: float = 5.0            # audio kept before and after each song
-    merge_gap_s: float = 10.0     # pauses shorter than this stay inside one song
+    merge_gap_s: float = 8.0      # breaks shorter than this stay inside one song
     eq_mode: str = "auto"         # "off", "fixed" or "auto" (match each song's own tone)
     eq_strength: float = 0.7      # how much of the measured imbalance auto EQ corrects
     compress: bool = True
@@ -168,11 +168,101 @@ def session_dir(out_dir, src):
     return d
 
 
+def music_activity(path, sr=11025, hop=512, n=1024):
+    """Per-second rhythm strength and loudness.
+
+    A band playing has a steady pulse: the onset strength (spectral flux) repeats every
+    beat, so its autocorrelation over a 6 s window is high (0.5-0.8). Talk, tuning and
+    noodling have no steady pulse (0.1-0.3), even when they are loud.
+    Returns (beat[1 per s], db[1 per s], duration_s).
+    """
+    raw = _run(["-i", str(path), "-ac", "1", "-ar", str(sr), "-f", "s16le", "-"]).stdout
+    x = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768
+    frames = (len(x) - n) // hop
+    if frames < 100:
+        return np.array([]), np.array([]), len(x) / sr
+    win = np.hanning(n).astype(np.float32)
+    flux = np.zeros(frames, np.float32)
+    power = np.zeros(frames, np.float32)
+    prev = None
+    for c in range(0, frames, 4096):                 # chunked STFT keeps memory low
+        idx = np.arange(n)[None, :] + hop * np.arange(c, min(frames, c + 4096))[:, None]
+        mag = np.abs(np.fft.rfft(x[idx] * win, axis=1)).astype(np.float32)
+        logm = np.log1p(100 * mag)
+        d = np.diff(logm, axis=0, prepend=logm[:1] if prev is None else prev[None, :])
+        flux[c:c + len(mag)] = np.maximum(0, d).sum(1)
+        power[c:c + len(mag)] = (mag ** 2).mean(1)
+        prev = logm[-1]
+    fps = sr / hop
+    W = int(6 * fps)
+    lag_lo, lag_hi = int(0.3 * fps), int(1.5 * fps)  # 40-200 BPM
+    secs = int(frames / fps)
+    beat = np.zeros(secs, np.float32)
+    db = np.zeros(secs, np.float32)
+    for s in range(secs):
+        a = int(s * fps)
+        lo, hi = max(0, a - W // 2), min(frames, a + W // 2)
+        seg = flux[lo:hi] - flux[lo:hi].mean()
+        if len(seg) > lag_hi + 4:
+            ac = np.correlate(seg, seg, "full")[len(seg) - 1:]
+            beat[s] = ac[lag_lo:lag_hi].max() / (ac[0] + 1e-9)
+        db[s] = 10 * np.log10(np.median(power[a:a + int(fps)]) + 1e-12)
+    return beat, db, len(x) / sr
+
+
+def detect_music(beat, db, duration, opt):
+    """Songs = stretches with a steady pulse, allowing short breaks inside a song."""
+    if len(beat) == 0:
+        return []
+    k = 5
+    smooth = np.convolve(beat, np.ones(k) / k, mode="same")
+    loud_ref = np.percentile(db, 90)
+    playing = (smooth > 0.42) & (db > loud_ref - 25)
+    # hysteresis: once playing, a weaker pulse (quiet verse, ending) still counts;
+    # going back towards the start is stricter so talk before the count-in stays out
+    hold_end = (smooth > 0.32) & (db > loud_ref - 30)
+    hold_start = (smooth > 0.38) & (db > loud_ref - 30)
+    for i in range(1, len(playing)):
+        if playing[i - 1] and hold_end[i]:
+            playing[i] = True
+    for i in range(len(playing) - 2, -1, -1):
+        if playing[i + 1] and hold_start[i]:
+            playing[i] = True
+    segs, start = [], None
+    for i, v in enumerate(playing):
+        if v and start is None:
+            start = i
+        elif not v and start is not None:
+            segs.append([start, i])
+            start = None
+    if start is not None:
+        segs.append([start, len(playing)])
+    merged = []
+    for s in segs:
+        if merged:
+            gap = s[0] - merged[-1][1]
+            band_level = np.median(db[merged[-1][0]:merged[-1][1]])
+            # a short break, or a longer one that stays as loud as the band
+            # (breakdown, free section, feedback), is still the same song
+            still_loud = gap <= 25 and np.median(db[merged[-1][1]:s[0]]) >= band_level - 3
+            if gap <= opt.merge_gap_s or still_loud:
+                merged[-1][1] = s[1]
+                continue
+        merged.append(s)
+    return [(max(0.0, s - opt.pad_s), min(duration, e + opt.pad_s))
+            for s, e in merged if e - s >= opt.min_song_s]
+
+
 def find_parts(src, opt):
-    db, duration = load_envelope(src)
+    if not opt.cut:
+        _, duration = load_envelope(src)
+        if duration == 0:
+            raise RuntimeError("Could not read audio")
+        return [(0.0, duration)]
+    beat, db, duration = music_activity(src)
     if duration == 0:
         raise RuntimeError("Could not read audio")
-    return detect_songs(db, duration, opt) if opt.cut else [(0.0, duration)]
+    return detect_music(beat, db, duration, opt)
 
 
 def process_file(src, out_dir, opt, log=print, on_song=None):

@@ -70,7 +70,7 @@ class Settings:
     def options(self):
         return core.Options(
             cut=self.get("cut", True, bool),
-            min_song_s=self.get("min_song_s", 120.0, float),
+            min_song_s=self.get("min_song_s", 60.0, float),
             pad_s=self.get("pad_s", 5.0, float),
             eq_mode=self.get("eq_mode", "auto"),
             eq_strength=self.get("eq_strength", 0.7, float),

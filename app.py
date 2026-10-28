@@ -5,7 +5,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal, QSettings
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
     QHBoxLayout, QLabel, QMainWindow, QPlainTextEdit, QProgressBar, QPushButton,
     QVBoxLayout, QWidget,
 )
@@ -67,13 +67,16 @@ class Main(QMainWindow):
         self.cut.setChecked(True)
         self.min_len = QDoubleSpinBox(); self.min_len.setRange(20, 600); self.min_len.setValue(120); self.min_len.setSuffix(" s")
         self.pad = QDoubleSpinBox(); self.pad.setRange(0, 30); self.pad.setValue(5); self.pad.setSuffix(" s")
-        self.eq = QCheckBox("EQ (cut rumble, boxiness and harshness)"); self.eq.setChecked(True)
+        self.eq = QComboBox()
+        self.eq.addItems(["Auto (match each song's tone)", "Fixed preset", "Off"])
+        self.strength = QDoubleSpinBox(); self.strength.setRange(0.1, 1.0); self.strength.setSingleStep(0.1); self.strength.setValue(0.7)
         self.comp = QCheckBox("Gentle compression"); self.comp.setChecked(True)
         self.norm = QCheckBox("Normalize loudness (-16 LUFS)"); self.norm.setChecked(True)
         form.addRow(self.cut)
         form.addRow("Shortest song", self.min_len)
         form.addRow("Padding around each song", self.pad)
-        form.addRow(self.eq)
+        form.addRow("EQ", self.eq)
+        form.addRow("Auto EQ strength", self.strength)
         form.addRow(self.comp)
         form.addRow(self.norm)
         out_row = QHBoxLayout()
@@ -128,7 +131,7 @@ class Main(QMainWindow):
             self.log.appendPlainText("No audio files in the drop.")
             return
         opt = core.Options(cut=self.cut.isChecked(), min_song_s=self.min_len.value(), pad_s=self.pad.value(),
-                           eq=self.eq.isChecked(), compress=self.comp.isChecked(), normalize=self.norm.isChecked())
+                           eq_mode=["auto", "fixed", "off"][self.eq.currentIndex()], eq_strength=self.strength.value(), compress=self.comp.isChecked(), normalize=self.norm.isChecked())
         self.bar.setRange(0, len(files))
         self.bar.setValue(0)
         self.worker = Worker(sorted(files), self.out_label.text(), opt)

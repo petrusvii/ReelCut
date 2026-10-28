@@ -17,7 +17,8 @@ class Options:
     min_song_s: float = 120.0     # pieces shorter than this are skipped
     pad_s: float = 5.0            # audio kept before and after each song
     merge_gap_s: float = 10.0     # pauses shorter than this stay inside one song
-    eq: bool = True
+    eq_mode: str = "auto"         # "off", "fixed" or "auto" (match each song's own tone)
+    eq_strength: float = 0.7      # how much of the measured imbalance auto EQ corrects
     compress: bool = True
     normalize: bool = True
     bitrate: str = "192k"
@@ -69,9 +70,40 @@ def detect_songs(db, duration, opt):
     return out
 
 
-def filter_chain(opt):
+BANDS = [63, 125, 250, 500, 1000, 2000, 4000, 8000]
+# Typical long-term average level of a balanced band mix per octave band (dB, relative).
+TARGET = [-4, 0, 0, -3, -6, -9, -12, -15]
+
+
+def measure_eq(src, start, end, opt):
+    """Per-band gains (dB) that move this song's average tone toward TARGET."""
+    sr = 24000
+    raw = _run(["-ss", f"{start:.2f}", "-to", f"{end:.2f}", "-i", str(src), "-ac", "1", "-ar", str(sr), "-f", "s16le", "-"]).stdout
+    x = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768
+    n = 4096
+    frames = len(x) // n
+    if frames < 10:
+        return [0.0] * len(BANDS)
+    fr = x[: frames * n].reshape(frames, n) * np.hanning(n)
+    power = np.abs(np.fft.rfft(fr, axis=1)) ** 2
+    loud = power.sum(1) >= np.median(power.sum(1))           # ignore pauses and talk
+    spec = power[loud].mean(0)
+    freqs = np.fft.rfftfreq(n, 1 / sr)
+    levels = []
+    for c in BANDS:
+        m = (freqs >= c / 2 ** 0.5) & (freqs < c * 2 ** 0.5)
+        levels.append(10 * np.log10(spec[m].sum() + 1e-12))
+    resid = np.array(TARGET) - np.array(levels)
+    resid -= np.median(resid)                                 # overall level is normalised later
+    return [float(np.clip(r * opt.eq_strength, -6, 3)) for r in resid]
+
+
+def filter_chain(opt, gains=None):
     f = []
-    if opt.eq:
+    if opt.eq_mode == "auto" and gains is not None:
+        f.append("highpass=f=60")
+        f += [f"equalizer=f={c}:t=o:w=1:g={g:.1f}" for c, g in zip(BANDS, gains) if abs(g) >= 0.3]
+    if opt.eq_mode == "fixed":
         f += [
             "highpass=f=80",                                   # rumble and handling noise
             "equalizer=f=250:t=q:w=1:g=-2.5",                  # boxy low mids
@@ -85,9 +117,9 @@ def filter_chain(opt):
     return ",".join(f)
 
 
-def export(src, dst, start, end, opt):
+def export(src, dst, start, end, opt, gains=None):
     args = ["-y", "-ss", f"{start:.2f}", "-to", f"{end:.2f}", "-i", str(src)]
-    chain = filter_chain(opt)
+    chain = filter_chain(opt, gains)
     if chain:
         args += ["-af", chain]
     args += ["-c:a", "libmp3lame", "-b:a", opt.bitrate, str(dst)]
@@ -113,6 +145,9 @@ def process_file(src, out_dir, opt, log=print):
         name = f"{src.stem}-song-{i:02d}.mp3" if opt.cut else f"{src.stem}-clean.mp3"
         dst = out_dir / name
         log(f"{src.name}: writing {name} ({int(s // 60)}:{int(s % 60):02d} - {int(e // 60)}:{int(e % 60):02d})")
-        export(src, dst, s, e, opt)
+        gains = measure_eq(src, s, e, opt) if opt.eq_mode == "auto" else None
+        if gains is not None:
+            log("  auto EQ: " + ", ".join(f"{c} Hz {g:+.1f}" for c, g in zip(BANDS, gains)))
+        export(src, dst, s, e, opt, gains)
         written.append(dst)
     return written

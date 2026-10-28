@@ -2,6 +2,7 @@
 import math
 import os
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -175,19 +176,42 @@ class SettingsDialog(QDialog):
 # ---------------------------------------------------------------- worker
 
 class Worker(QThread):
+    """Works through a queue of recordings; more can be added while it runs."""
     status = Signal(str)
+    recording = Signal(str)                      # a new recording is being processed
     song = Signal(str, float, float, object)     # path, start, end, envelope
     progress = Signal(float)
-    finished_all = Signal(int)
+    finished_all = Signal(int, int)              # songs written, recordings done
 
     def __init__(self, files, out_dir, opt):
         super().__init__()
-        self.files, self.out_dir, self.opt = files, out_dir, opt
+        self.out_dir, self.opt = out_dir, opt
+        self.queue, self.done = list(files), 0
+        self.lock = threading.Lock()
+
+    def add(self, files):
+        """Queue more files; False if the worker already finished (start a new one)."""
+        with self.lock:
+            if self.queue is None:
+                return False
+            self.queue += [f for f in files if f not in self.queue]
+            return True
+
+    def waiting(self):
+        with self.lock:
+            return len(self.queue or [])
 
     def run(self):
         count = 0
-        for i, f in enumerate(self.files):
-            self.progress.emit(i / len(self.files))
+        while True:
+            with self.lock:
+                if not self.queue:
+                    self.queue = None            # closed: later drops start a new worker
+                    break
+                f = self.queue.pop(0)
+                total = self.done + len(self.queue) + 1
+            self.progress.emit(self.done / total)
+            self.recording.emit(Path(f).name)
 
             def on_song(path, s, e):
                 env, _ = core.load_envelope(path)
@@ -197,8 +221,9 @@ class Worker(QThread):
                 count += len(core.process_file(f, self.out_dir, self.opt, self.status.emit, on_song))
             except Exception as e:  # keep going with the next file
                 self.status.emit(f"{Path(f).name}: failed ({e})")
+            self.done += 1
         self.progress.emit(1.0)
-        self.finished_all.emit(count)
+        self.finished_all.emit(count, self.done)
 
 
 # ---------------------------------------------------------------- deck
@@ -460,6 +485,8 @@ QLabel {{ color: {INK}; font-family: {LABEL}; }}
 QWidget#sheet {{ background: {CREAM}; border: 1px solid #b9ab86; border-radius: 6px; }}
 QLabel#sheettitle {{ font-size: 12px; letter-spacing: 3px; font-weight: 600; color: #6b5d43; }}
 QFrame#songrow {{ border-bottom: 1px solid #d9cba6; }}
+QLabel#rechead {{ font-family: Consolas; font-size: 12px; color: #6b5d43; padding: 10px 4px 2px 4px;
+                  border-bottom: 2px solid #b9ab86; }}
 QLabel#num {{ font-family: Consolas; font-size: 15px; color: #8a7a58; min-width: 26px; }}
 QLabel#dur {{ font-family: Consolas; font-size: 13px; color: #6b5d43; }}
 QLineEdit {{ background: transparent; border: none; border-bottom: 1px dashed #b9ab86;
@@ -549,9 +576,12 @@ class Main(QMainWindow):
 
         keys = QHBoxLayout()
         self.k_load = self.key("LOAD", self.choose_files)
+        self.k_clear = self.key("CLEAR LIST", self.clear_list)
+        self.k_clear.setToolTip("Empties the track sheet. Saved songs stay in their folder.")
         self.k_open = self.key("OPEN FOLDER", self.open_out)
         self.k_set = self.key("SETTINGS", self.settings)
         keys.addWidget(self.k_load)
+        keys.addWidget(self.k_clear)
         keys.addStretch(1)
         keys.addWidget(self.k_open)
         keys.addWidget(self.k_set)
@@ -590,8 +620,6 @@ class Main(QMainWindow):
         self.start([u.toLocalFile() for u in e.mimeData().urls()])
 
     def choose_files(self):
-        if self.busy():
-            return
         files, _ = QFileDialog.getOpenFileNames(
             self, "Choose recordings", "",
             "Audio (*.mp3 *.wav *.m4a *.aac *.flac *.ogg *.mp4 *.mov *.wma *.opus)")
@@ -611,56 +639,86 @@ class Main(QMainWindow):
 
     # -- processing
     def start(self, paths):
-        if self.busy():
-            self.deck.label = "Still working, one batch at a time"
-            return
-        files = sorted(p for p in paths if Path(p).suffix.lower() in AUDIO)
+        """Process dropped files; while busy they join the queue. Earlier songs stay listed."""
+        files = []
+        for p in paths:
+            p = Path(p)
+            if p.is_dir():                       # a dropped folder: take the audio files in it
+                files += sorted(str(f) for f in p.iterdir() if f.suffix.lower() in AUDIO)
+            elif p.suffix.lower() in AUDIO:
+                files.append(str(p))
+        files = sorted(dict.fromkeys(files))
         if not files:
             self.deck.label = "That doesn't look like an audio file"
             return
-        self.stop_playback()
-        self.clear_rows()
+        if self.worker and self.worker.add(files):
+            self.deck.label = f"Added {len(files)} to the queue"
+            self.show_queue()
+            return
         self.deck.progress = 0
         self.deck.speed = 6
-        self.deck.counter = "00 / --"
-        self.k_load.setEnabled(False)
         self.k_set.setEnabled(False)
+        self.k_clear.setEnabled(False)
         self.worker = Worker(files, self.st.out_dir, self.st.options())
         self.worker.status.connect(self.on_status)
+        self.worker.recording.connect(self.add_header)
         self.worker.song.connect(self.add_row)
         self.worker.progress.connect(lambda v: setattr(self.deck, "progress", v))
         self.worker.finished_all.connect(self.on_done)
         self.worker.start()
+        self.show_queue()
+
+    def show_queue(self):
+        if not self.current:
+            n = self.worker.waiting() if self.busy() else 0
+            self.deck.counter = f"Q {n:02d}" if n else "-- --"
 
     def on_status(self, text):
         self.deck.label = text
+        self.show_queue()
 
-    def on_done(self, count):
-        self.deck.speed = 0
+    def on_done(self, count, recordings):
         self.deck.progress = 1
-        self.k_load.setEnabled(True)
+        if not self.current:
+            self.deck.speed = 0
         self.k_set.setEnabled(True)
-        self.deck.label = (f"{count} song{'s' if count != 1 else ''} ready. Play, name, done."
+        self.k_clear.setEnabled(True)
+        rec = f" from {recordings} recordings" if recordings > 1 else ""
+        self.deck.label = (f"{count} song{'s' if count != 1 else ''} ready{rec}. Play, name, done."
                            if count else "No songs found. Try a shorter song length in Settings")
-        self.deck.counter = f"{count:02d} SONGS"
+        if not self.current:
+            self.deck.counter = f"{len(self.rows):02d} SONGS"
 
-    def clear_rows(self):
-        for r in self.rows:
-            r.setParent(None)
+    def clear_list(self):
+        if self.busy():
+            return
+        self.stop_playback()
+        while self.list_lay.count() > 2:         # keep the 'empty' hint and the stretch
+            self.list_lay.takeAt(1).widget().setParent(None)
         self.rows = []
         self.pending = {}
         self.empty.show()
+        self.deck.counter = "--:--"
+        self.deck.progress = 0
+        self.deck.label = "Drop recordings here"
+
+    def add_header(self, name):
+        self.empty.hide()
+        h = QLabel(Path(name).stem)
+        h.setObjectName("rechead")
+        self.list_lay.insertWidget(self.list_lay.count() - 1, h)
 
     def add_row(self, path, s, e, env):
         self.empty.hide()
-        row = SongRow(len(self.rows) + 1, path, s, e, env)
+        stem = Path(path).stem
+        num = int(stem.split(" ")[1]) if stem.startswith("Song ") else len(self.rows) + 1
+        row = SongRow(num, path, s, e, env)
         row.play.connect(self.toggle_play)
         row.renamed.connect(self.rename)
         row.seek.connect(self.seek)
         self.rows.append(row)
         self.list_lay.insertWidget(self.list_lay.count() - 1, row)
         self.last_folder = str(Path(path).parent)
-        self.deck.counter = f"{len(self.rows):02d} / --"
 
     # -- naming
     def rename(self, row, title):

@@ -95,7 +95,8 @@ def measure_eq(src, start, end, opt):
         levels.append(10 * np.log10(spec[m].sum() + 1e-12))
     resid = np.array(TARGET) - np.array(levels)
     resid -= np.median(resid)                                 # overall level is normalised later
-    return [float(np.clip(r * opt.eq_strength, -6, 3)) for r in resid]
+    # cut up to 6 dB anywhere; boost up to 6 dB in the bass (thin recordings), 3 dB above
+    return [float(np.clip(r * opt.eq_strength, -6, 6 if c <= 250 else 3)) for c, r in zip(BANDS, resid)]
 
 
 def filter_chain(opt, gains=None):

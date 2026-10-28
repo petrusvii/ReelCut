@@ -1,6 +1,6 @@
 ; Reel Cut installer: per-user install, no admin rights, nothing downloaded.
 #define AppName "Reel Cut"
-#define AppVersion "1.0.0"
+#define AppVersion "1.0.1"
 #define AppExe "ReelCut.exe"
 
 [Setup]

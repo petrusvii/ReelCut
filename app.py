@@ -14,7 +14,7 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
     QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
-    QScrollArea, QVBoxLayout, QWidget,
+    QScrollArea, QSlider, QStyle, QVBoxLayout, QWidget,
 )
 
 import core
@@ -387,16 +387,37 @@ class Deck(QWidget):
 
 # ---------------------------------------------------------------- song list
 
+START_AT = 0.10     # play from 10 % in, past the count-in
+
+
+class SeekBar(QSlider):
+    """Thin tape-position slider; a click jumps straight to that spot."""
+
+    def __init__(self):
+        super().__init__(Qt.Horizontal)
+        self.setRange(0, 1000)
+        self.setValue(int(START_AT * 1000))
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            v = QStyle.sliderValueFromPosition(self.minimum(), self.maximum(), int(e.position().x()), self.width())
+            self.setValue(v)
+            self.sliderMoved.emit(v)
+        super().mousePressEvent(e)
+
+
 class SongRow(QFrame):
     play = Signal(object)
     renamed = Signal(object, str)
+    seek = Signal(object, float)
 
     def __init__(self, num, path, start, end, env):
         super().__init__()
         self.path, self.env = Path(path), env
         self.setObjectName("songrow")
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(10, 4, 10, 4)
+        lay.setContentsMargins(10, 4, 10, 6)
         n = QLabel(f"{num:02d}")
         n.setObjectName("num")
         self.btn = QPushButton("▶")
@@ -409,13 +430,28 @@ class SongRow(QFrame):
         d = end - start
         t = QLabel(f"{int(d // 60)}:{int(d % 60):02d}")
         t.setObjectName("dur")
+        self.bar = SeekBar()
+        self.bar.setToolTip("Where to listen from. Click or drag.")
+        self.bar.sliderMoved.connect(lambda v: self.seek.emit(self, v / 1000))
+        mid = QVBoxLayout()
+        mid.setSpacing(2)
+        mid.addWidget(self.name)
+        mid.addWidget(self.bar)
         lay.addWidget(n)
         lay.addWidget(self.btn)
-        lay.addWidget(self.name, 1)
+        lay.addLayout(mid, 1)
         lay.addWidget(t)
+
+    @property
+    def start_frac(self):
+        return self.bar.value() / 1000
 
     def set_playing(self, on):
         self.btn.setText("■" if on else "▶")
+
+    def show_position(self, frac):
+        if not self.bar.isSliderDown():
+            self.bar.setValue(int(frac * 1000))
 
 
 STYLE = f"""
@@ -439,6 +475,9 @@ QPushButton#key {{ font-family: {LABEL}; font-size: 12px; font-weight: 600; lett
 QPushButton#key:hover {{ background: #fff8e8; }}
 QPushButton#key:pressed {{ background: #cfc19b; padding-top: 12px; }}
 QPushButton#key:disabled {{ color: #9b937f; }}
+QSlider::groove:horizontal {{ height: 4px; background: #d9cba6; border-radius: 2px; }}
+QSlider::sub-page:horizontal {{ background: #6b4a30; border-radius: 2px; }}
+QSlider::handle:horizontal {{ width: 6px; margin: -6px 0; background: {RED}; border-radius: 1px; }}
 QScrollArea, QScrollArea > QWidget > QWidget, QWidget#listbox {{ border: none; background: transparent; }}
 QDialog QLabel, QDialog QCheckBox {{ font-size: 13px; }}
 """
@@ -463,6 +502,7 @@ class Main(QMainWindow):
         self.player.setAudioOutput(self.audio)
         self.player.positionChanged.connect(self.on_position)
         self.player.mediaStatusChanged.connect(self.on_media_status)
+        self.seek_to = None
 
         c = QWidget()
         self.setCentralWidget(c)
@@ -616,6 +656,7 @@ class Main(QMainWindow):
         row = SongRow(len(self.rows) + 1, path, s, e, env)
         row.play.connect(self.toggle_play)
         row.renamed.connect(self.rename)
+        row.seek.connect(self.seek)
         self.rows.append(row)
         self.list_lay.insertWidget(self.list_lay.count() - 1, row)
         self.last_folder = str(Path(path).parent)
@@ -647,16 +688,23 @@ class Main(QMainWindow):
             return
         self.current = row
         row.set_playing(True)
+        self.seek_to = row.start_frac      # applied on the first position update, once playing
         self.player.setSource(QUrl.fromLocalFile(str(row.path)))
         self.player.play()
         self.deck.speed = 2.5
 
+    def seek(self, row, frac):
+        if row is self.current and self.player.duration() > 0:
+            self.player.setPosition(int(frac * self.player.duration()))
+
+
     def stop_playback(self):
         if self.current:
             self.current.set_playing(False)
+        self.current = None                # before stop(), so the reset to 0 doesn't move the bar
+        self.seek_to = None
         self.player.stop()
         self.player.setSource(QUrl())
-        self.current = None
         self.deck.level = -60
         if not self.busy():
             self.deck.speed = 0
@@ -672,11 +720,19 @@ class Main(QMainWindow):
         if env is not None and 0 <= i < len(env):
             self.deck.level = float(env[i])
         dur = self.player.duration()
-        if dur > 0 and not self.busy():
-            self.deck.progress = ms / dur
+        if dur > 0 and self.seek_to is not None:
+            self.player.setPosition(int(self.seek_to * dur))
+            self.seek_to = None
+            return
+        if dur > 0:
+            self.current.show_position(ms / dur)
+            if not self.busy():
+                self.deck.progress = ms / dur
 
     def on_media_status(self, status):
         if status == QMediaPlayer.EndOfMedia:
+            if self.current:
+                self.current.bar.setValue(int(START_AT * 1000))
             self.stop_playback()
 
     def closeEvent(self, e):

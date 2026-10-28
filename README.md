@@ -2,6 +2,8 @@
 
 Drop band rehearsal or gig recordings (phone audio) on the window. Reel Cut finds the songs, cuts them into separate files and balances the sound. Listen to recognise each song, type its name, press DONE.
 
+![Reel Cut](assets/screenshot.png)
+
 - **Flow:** 1 Drop recordings (several at once, or more while it works) → 2 Listen & name → 3 DONE (saves all names, opens the folder, clears the list). The deck display shows the cutting job and what is playing on separate lines; the reels spin only while cutting.
 - **Songs:** found by rhythm (a steady pulse means the band is playing; talk and tuning don't have one), so quiet passages and breakdowns stay inside a song. Saved as `<Save folder>\<recording name>\Song 01.mp3`; typing a name renames the file to `01 <name>.mp3`.
 - **Per song:** small waveform that is also the seek bar (playback starts 10 % in, past the count-in), ⟷ recut wider (brings back a cut-off intro or ending), ✕ discard (to the Recycle Bin).

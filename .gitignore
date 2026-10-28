@@ -3,3 +3,4 @@ dist/
 _test/
 __pycache__/
 *.spec
+installer/Output/

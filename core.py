@@ -21,7 +21,35 @@ class Options:
     eq_strength: float = 0.7      # how much of the measured imbalance auto EQ corrects
     compress: bool = True
     normalize: bool = True
-    bitrate: str = "192k"
+    fmt: str = "mp3"              # "mp3", "wav", "flac" or "same" (as the original)
+
+
+# ffmpeg codec arguments per output extension; mp3 is VBR medium quality (~165 kbps)
+CODECS = {
+    ".mp3": ["-c:a", "libmp3lame", "-q:a", "4"],
+    ".wav": ["-c:a", "pcm_s16le"],
+    ".flac": ["-c:a", "flac"],
+    ".m4a": ["-c:a", "aac", "-b:a", "192k"],
+    ".aac": ["-c:a", "aac", "-b:a", "192k"],
+    ".ogg": ["-c:a", "libvorbis", "-q:a", "5"],
+    ".opus": ["-c:a", "libopus", "-b:a", "128k"],
+}
+SAME_AS = {".mp4": ".m4a", ".mov": ".m4a"}     # video containers: keep the audio as m4a
+
+
+def out_ext(src, opt):
+    if opt.fmt != "same":
+        return "." + opt.fmt
+    ext = Path(src).suffix.lower()
+    ext = SAME_AS.get(ext, ext)
+    return ext if ext in CODECS else ".mp3"
+
+
+def safe_name(name):
+    """Turn a typed song title into a valid Windows file name."""
+    bad = '<>:"/\\|?*'
+    name = "".join("_" if ch in bad or ord(ch) < 32 else ch for ch in name).strip(" .")
+    return name[:120]
 
 
 def _run(args):
@@ -123,32 +151,65 @@ def export(src, dst, start, end, opt, gains=None):
     chain = filter_chain(opt, gains)
     if chain:
         args += ["-af", chain]
-    args += ["-c:a", "libmp3lame", "-b:a", opt.bitrate, str(dst)]
+    args += CODECS[Path(dst).suffix.lower()] + [str(dst)]
     r = _run(args)
     if r.returncode != 0:
         raise RuntimeError(r.stderr.decode(errors="replace")[-400:])
 
 
-def process_file(src, out_dir, opt, log=print):
-    """Cut one recording into songs (or keep it whole) and write cleaned mp3s."""
-    src, out_dir = Path(src), Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    log(f"{src.name}: analysing")
+def session_dir(out_dir, src):
+    """One folder per recording, never reusing an existing one."""
+    base = Path(out_dir) / Path(src).stem
+    d, n = base, 2
+    while d.exists():
+        d = base.with_name(f"{base.name} ({n})")
+        n += 1
+    d.mkdir(parents=True)
+    return d
+
+
+def find_parts(src, opt):
     db, duration = load_envelope(src)
     if duration == 0:
         raise RuntimeError("Could not read audio")
-    parts = detect_songs(db, duration, opt) if opt.cut else [(0.0, duration)]
+    return detect_songs(db, duration, opt) if opt.cut else [(0.0, duration)]
+
+
+def process_file(src, out_dir, opt, log=print, on_song=None):
+    """Cut one recording into songs (or keep it whole) and write cleaned files.
+
+    Songs are written to <out_dir>/<recording name>/Song 01.<ext> and so on.
+    on_song(path, start, end) is called as each file is finished.
+    """
+    src = Path(src)
+    log(f"{src.name}: listening for songs")
+    parts = find_parts(src, opt)
     if not parts:
-        log(f"{src.name}: no songs found (try a shorter minimum length)")
+        log(f"{src.name}: no songs found (try a shorter minimum song length in Settings)")
         return []
+    folder = session_dir(out_dir, src)
+    ext = out_ext(src, opt)
     written = []
     for i, (s, e) in enumerate(parts, 1):
-        name = f"{src.stem}-song-{i:02d}.mp3" if opt.cut else f"{src.stem}-clean.mp3"
-        dst = out_dir / name
-        log(f"{src.name}: writing {name} ({int(s // 60)}:{int(s % 60):02d} - {int(e // 60)}:{int(e % 60):02d})")
+        dst = folder / f"Song {i:02d}{ext}"
+        log(f"{src.name}: {dst.name} ({int(s // 60)}:{int(s % 60):02d} - {int(e // 60)}:{int(e % 60):02d})")
         gains = measure_eq(src, s, e, opt) if opt.eq_mode == "auto" else None
-        if gains is not None:
-            log("  auto EQ: " + ", ".join(f"{c} Hz {g:+.1f}" for c, g in zip(BANDS, gains)))
         export(src, dst, s, e, opt, gains)
         written.append(dst)
+        if on_song:
+            on_song(dst, s, e)
     return written
+
+
+def rename_song(path, title):
+    """Rename a finished song to '<NN> <title>.<ext>'; returns the new path."""
+    path = Path(path)
+    num = path.stem.split(" ")[1] if path.stem.startswith("Song ") else path.stem[:2]
+    title = safe_name(title)
+    new = path.with_name(f"{num} {title}{path.suffix}" if title else f"Song {num}{path.suffix}")
+    if new == path:
+        return path
+    if new.exists():
+        raise FileExistsError(new.name)
+    path.rename(new)
+    return new

@@ -1,8 +1,10 @@
 # Reel Cut
 
-Drop band rehearsal or gig recordings (phone audio) on the tape deck. Reel Cut finds the songs, cuts them into separate files and balances the sound. Play a song to recognise it, type its name, done.
+Drop band rehearsal or gig recordings (phone audio) on the window. Reel Cut finds the songs, cuts them into separate files and balances the sound. Listen to recognise each song, type its name, press DONE.
 
-- **Songs:** found by loudness (adapts to quiet recordings). Saved as `<Save folder>\<recording name>\Song 01.mp3`; typing a name renames the file to `01 <name>.mp3`.
+- **Flow:** 1 Drop recordings (several at once, or more while it works) → 2 Listen & name → 3 DONE (saves all names, opens the folder, clears the list). The deck display shows the cutting job and what is playing on separate lines; the reels spin only while cutting.
+- **Songs:** found by rhythm (a steady pulse means the band is playing; talk and tuning don't have one), so quiet passages and breakdowns stay inside a song. Saved as `<Save folder>\<recording name>\Song 01.mp3`; typing a name renames the file to `01 <name>.mp3`.
+- **Per song:** small waveform that is also the seek bar (playback starts 10 % in, past the count-in), ⟷ recut wider (brings back a cut-off intro or ending), ✕ discard (to the Recycle Bin).
 - **Sound:** Auto EQ per song (matches a balanced band tone, e.g. tames bass when the phone sat on the bass amp), gentle compression, loudness normalisation to -16 LUFS. Each can be switched off in Settings.
 - **Formats:** MP3 medium quality (default, VBR q4), WAV, FLAC, or same as the original.
 - **Settings:** save folder, format, shortest song, extra time around songs, EQ mode and strength, compression, normalisation.

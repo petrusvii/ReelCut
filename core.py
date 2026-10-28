@@ -303,3 +303,48 @@ def rename_song(path, title):
         raise FileExistsError(new.name)
     path.rename(new)
     return new
+
+
+def widen(db, duration, start, end, pad_s=2.0, reach_s=45.0, step_s=15.0):
+    """Wider edges for a song whose quiet intro or ringing outro was cut off.
+
+    db is the 0.5 s loudness envelope of the whole recording. Each edge moves out to
+    the next real pause (1.5 s near the room's noise floor), at least 3 s further out and
+    at most reach_s away; if there is no pause in reach it moves step_s. Calling it again
+    widens again, so a user can keep pressing until the song is whole.
+    """
+    floor = np.percentile(db, 10)
+    quiet = db < floor + 6
+    run = 3                                            # 3 x 0.5 s = 1.5 s of quiet
+
+    def pause_before(i):
+        lo = max(0, i - int(reach_s * 2))
+        for j in range(i - 6, lo + run - 1, -1):
+            if quiet[j - run + 1:j + 1].all():
+                return j + 1
+        return None
+
+    def pause_after(i):
+        hi = min(len(db), i + int(reach_s * 2))
+        for j in range(i + 6, hi - run + 1):
+            if quiet[j:j + run].all():
+                return j
+        return None
+
+    si, ei = int(start * 2), int(end * 2)
+    ps, pe = pause_before(si), pause_after(ei)
+    new_s = ps / 2 - pad_s if ps is not None else start - step_s
+    new_e = pe / 2 + pad_s if pe is not None else end + step_s
+    return max(0.0, new_s), min(duration, new_e)
+
+
+def recut_song(src, dst, start, end, opt, db=None, duration=None):
+    """Re-export dst from src with wider edges; returns the new (start, end)."""
+    if db is None:
+        db, duration = load_envelope(src)
+    s, e = widen(db, duration, start, end)
+    gains = measure_eq(src, s, e, opt) if opt.eq_mode == "auto" else None
+    tmp = Path(dst).with_name(Path(dst).stem + ".recut" + Path(dst).suffix)
+    export(src, tmp, s, e, opt, gains)
+    tmp.replace(dst)
+    return s, e

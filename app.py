@@ -6,7 +6,7 @@ import threading
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, QSettings, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QFile, QPointF, QRectF, QSettings, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QIcon, QImage, QLinearGradient, QPainter, QPainterPath, QPen,
     QPixmap, QRadialGradient,
@@ -175,11 +175,29 @@ class SettingsDialog(QDialog):
 
 # ---------------------------------------------------------------- worker
 
+class RecutWorker(QThread):
+    """Re-exports one song with wider edges."""
+    done = Signal(object, float, float, object, str)   # row, start, end, envelope, error
+
+    def __init__(self, row, opt):
+        super().__init__()
+        self.row, self.opt = row, opt
+
+    def run(self):
+        r = self.row
+        try:
+            s, e = core.recut_song(r.src, r.path, r.start, r.end, self.opt)
+            env, _ = core.load_envelope(r.path)
+            self.done.emit(r, s, e, env, "")
+        except Exception as ex:
+            self.done.emit(r, r.start, r.end, r.env, str(ex))
+
+
 class Worker(QThread):
     """Works through a queue of recordings; more can be added while it runs."""
     status = Signal(str)
     recording = Signal(str)                      # a new recording is being processed
-    song = Signal(str, float, float, object)     # path, start, end, envelope
+    song = Signal(str, float, float, object, str)  # path, start, end, envelope, source
     progress = Signal(float)
     finished_all = Signal(int, int)              # songs written, recordings done
 
@@ -213,9 +231,9 @@ class Worker(QThread):
             self.progress.emit(self.done / total)
             self.recording.emit(Path(f).name)
 
-            def on_song(path, s, e):
+            def on_song(path, s, e, src=f):
                 env, _ = core.load_envelope(path)
-                self.song.emit(str(path), s, e, env)
+                self.song.emit(str(path), s, e, env, str(src))
 
             try:
                 count += len(core.process_file(f, self.out_dir, self.opt, self.status.emit, on_song))
@@ -436,10 +454,13 @@ class SongRow(QFrame):
     play = Signal(object)
     renamed = Signal(object, str)
     seek = Signal(object, float)
+    recut = Signal(object)
+    discard = Signal(object)
 
-    def __init__(self, num, path, start, end, env):
+    def __init__(self, num, path, start, end, env, src):
         super().__init__()
-        self.path, self.env = Path(path), env
+        self.path, self.env, self.src = Path(path), env, src
+        self.start, self.end = start, end
         self.setObjectName("songrow")
         lay = QHBoxLayout(self)
         lay.setContentsMargins(10, 4, 10, 6)
@@ -452,9 +473,20 @@ class SongRow(QFrame):
         self.name = QLineEdit()
         self.name.setPlaceholderText(f"Song {num:02d}  (type a name)")
         self.name.editingFinished.connect(lambda: self.renamed.emit(self, self.name.text()))
-        d = end - start
-        t = QLabel(f"{int(d // 60)}:{int(d % 60):02d}")
-        t.setObjectName("dur")
+        self.dur = QLabel()
+        self.dur.setObjectName("dur")
+        self.set_span(start, end, env)
+        self.b_recut = QPushButton("⟷")
+        self.b_recut.setObjectName("small")
+        self.b_recut.setToolTip("Recut wider: brings back a cut-off intro or ending.\nPress again to widen more.")
+        self.b_recut.clicked.connect(lambda: self.recut.emit(self))
+        self.b_discard = QPushButton("✕")
+        self.b_discard.setObjectName("small")
+        self.b_discard.setToolTip("Discard this take (moves the file to the Recycle Bin)")
+        self.b_discard.clicked.connect(lambda: self.discard.emit(self))
+        for b in (self.b_recut, self.b_discard):
+            b.setFixedSize(30, 30)
+            b.setCursor(Qt.PointingHandCursor)
         self.bar = SeekBar()
         self.bar.setToolTip("Where to listen from. Click or drag.")
         self.bar.sliderMoved.connect(lambda v: self.seek.emit(self, v / 1000))
@@ -465,7 +497,20 @@ class SongRow(QFrame):
         lay.addWidget(n)
         lay.addWidget(self.btn)
         lay.addLayout(mid, 1)
-        lay.addWidget(t)
+        lay.addWidget(self.dur)
+        lay.addWidget(self.b_recut)
+        lay.addWidget(self.b_discard)
+
+    def set_span(self, start, end, env):
+        self.start, self.end, self.env = start, end, env
+        d = end - start
+        self.dur.setText(f"{int(d // 60)}:{int(d % 60):02d}")
+
+    def set_working(self, on):
+        for w in (self.btn, self.b_recut, self.b_discard, self.bar):
+            w.setEnabled(not on)
+        if on:
+            self.dur.setText("···")
 
     @property
     def start_frac(self):
@@ -496,6 +541,10 @@ QPushButton#play {{ border-radius: 17px; font-size: 13px; color: #f4f4f0;
     background: qradialgradient(cx:0.4, cy:0.35, radius:0.8, stop:0 #5a5650, stop:1 #1e1c19);
     border: 2px solid #8d8d88; }}
 QPushButton#play:hover {{ border-color: {AMBER}; }}
+QPushButton#small {{ font-size: 14px; color: #6b5d43; background: transparent;
+    border: 1px solid #c9b98f; border-radius: 4px; }}
+QPushButton#small:hover {{ color: {RED}; border-color: {RED}; background: #fff6df; }}
+QPushButton#small:disabled {{ color: #cdbf9a; border-color: #e0d3b0; }}
 QPushButton#key {{ font-family: {LABEL}; font-size: 12px; font-weight: 600; letter-spacing: 2px;
     color: {INK}; padding: 10px 18px; border: 1px solid #7d776a; border-radius: 4px;
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #fbf4e2, stop:1 #ddd0ad); }}
@@ -530,6 +579,7 @@ class Main(QMainWindow):
         self.player.positionChanged.connect(self.on_position)
         self.player.mediaStatusChanged.connect(self.on_media_status)
         self.seek_to = None
+        self.recuts = set()
 
         c = QWidget()
         self.setCentralWidget(c)
@@ -708,17 +758,57 @@ class Main(QMainWindow):
         h.setObjectName("rechead")
         self.list_lay.insertWidget(self.list_lay.count() - 1, h)
 
-    def add_row(self, path, s, e, env):
+    def add_row(self, path, s, e, env, src):
         self.empty.hide()
         stem = Path(path).stem
         num = int(stem.split(" ")[1]) if stem.startswith("Song ") else len(self.rows) + 1
-        row = SongRow(num, path, s, e, env)
+        row = SongRow(num, path, s, e, env, src)
         row.play.connect(self.toggle_play)
         row.renamed.connect(self.rename)
         row.seek.connect(self.seek)
+        row.recut.connect(self.recut)
+        row.discard.connect(self.discard)
         self.rows.append(row)
         self.list_lay.insertWidget(self.list_lay.count() - 1, row)
         self.last_folder = str(Path(path).parent)
+
+    # -- fixing takes
+    def release(self, row):
+        """Stop playback of this row and apply its pending rename, so the file is free."""
+        if row is self.current:
+            self.stop_playback()
+
+    def recut(self, row):
+        self.release(row)
+        row.set_working(True)
+        self.deck.label = f"Recutting {row.path.stem} wider"
+        w = RecutWorker(row, self.st.options())
+        w.done.connect(self.on_recut)
+        self.recuts.add(w)                  # keep a reference until it finishes
+        w.finished.connect(lambda: self.recuts.discard(w))
+        w.start()
+
+    def on_recut(self, row, s, e, env, err):
+        if row not in self.rows:            # discarded or cleared meanwhile
+            return
+        grew = (row.start - s) + (e - row.end)
+        row.set_span(s, e, env)
+        row.set_working(False)
+        row.bar.setValue(int(START_AT * 1000))
+        if err:
+            self.deck.label = f"Recut failed: {err[:60]}"
+        else:
+            self.deck.label = f"{row.path.stem}: {grew:.0f} s more. Press ⟷ again for more"
+
+    def discard(self, row):
+        self.release(row)
+        self.pending.pop(row, None)
+        if row.path.exists() and not QFile.moveToTrash(str(row.path)):
+            QMessageBox.warning(self, APP, f"Could not move {row.path.name} to the Recycle Bin.")
+            return
+        self.rows.remove(row)
+        row.setParent(None)
+        self.deck.label = f"{row.path.stem} moved to the Recycle Bin"
 
     # -- naming
     def rename(self, row, title):

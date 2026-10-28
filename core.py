@@ -265,15 +265,18 @@ def find_parts(src, opt):
     return detect_music(beat, db, duration, opt)
 
 
-def process_file(src, out_dir, opt, log=print, on_song=None):
+def process_file(src, out_dir, opt, log=print, on_song=None, on_parts=None):
     """Cut one recording into songs (or keep it whole) and write cleaned files.
 
     Songs are written to <out_dir>/<recording name>/Song 01.<ext> and so on.
-    on_song(path, start, end) is called as each file is finished.
+    on_parts(n) is called once the songs are found; on_song(path, start, end) as each
+    file is finished.
     """
     src = Path(src)
     log(f"{src.name}: listening for songs")
     parts = find_parts(src, opt)
+    if on_parts:
+        on_parts(len(parts))
     if not parts:
         log(f"{src.name}: no songs found (try a shorter minimum song length in Settings)")
         return []

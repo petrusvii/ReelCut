@@ -3,12 +3,13 @@ import math
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QFile, QPointF, QRectF, QSettings, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import (
-    QBrush, QColor, QFont, QIcon, QImage, QLinearGradient, QPainter, QPainterPath, QPen,
+    QBrush, QColor, QFont, QFontMetrics, QIcon, QImage, QLinearGradient, QPainter, QPainterPath, QPen,
     QPixmap, QRadialGradient,
 )
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -173,7 +174,7 @@ class SettingsDialog(QDialog):
         self.accept()
 
 
-# ---------------------------------------------------------------- worker
+# ---------------------------------------------------------------- workers
 
 class RecutWorker(QThread):
     """Re-exports one song with wider edges."""
@@ -195,11 +196,12 @@ class RecutWorker(QThread):
 
 class Worker(QThread):
     """Works through a queue of recordings; more can be added while it runs."""
-    status = Signal(str)
-    recording = Signal(str)                      # a new recording is being processed
+    job = Signal(int, int, str)                    # recording number, total so far, file name
+    parts = Signal(int)                            # songs found in the current recording
     song = Signal(str, float, float, object, str)  # path, start, end, envelope, source
     progress = Signal(float)
-    finished_all = Signal(int, int)              # songs written, recordings done
+    failed = Signal(str)
+    finished_all = Signal(int, int)                # songs written, recordings done
 
     def __init__(self, files, out_dir, opt):
         super().__init__()
@@ -228,17 +230,24 @@ class Worker(QThread):
                     break
                 f = self.queue.pop(0)
                 total = self.done + len(self.queue) + 1
+            self.job.emit(self.done + 1, total, Path(f).name)
             self.progress.emit(self.done / total)
-            self.recording.emit(Path(f).name)
+            state = {"n": 0, "k": 0}
+
+            def on_parts(n):
+                state["n"] = n
+                self.parts.emit(n)
 
             def on_song(path, s, e, src=f):
                 env, _ = core.load_envelope(path)
                 self.song.emit(str(path), s, e, env, str(src))
+                state["k"] += 1
+                self.progress.emit((self.done + state["k"] / max(1, state["n"])) / total)
 
             try:
-                count += len(core.process_file(f, self.out_dir, self.opt, self.status.emit, on_song))
+                count += len(core.process_file(f, self.out_dir, self.opt, lambda m: None, on_song, on_parts))
             except Exception as e:  # keep going with the next file
-                self.status.emit(f"{Path(f).name}: failed ({e})")
+                self.failed.emit(f"{Path(f).name}: {e}")
             self.done += 1
         self.progress.emit(1.0)
         self.finished_all.emit(count, self.done)
@@ -246,49 +255,47 @@ class Worker(QThread):
 
 # ---------------------------------------------------------------- deck
 
+def fmt_time(s):
+    s = max(0, int(s))
+    return f"{s // 60}:{s % 60:02d}"
+
+
 class Deck(QWidget):
-    """Reel-to-reel transport: two reels, a VU meter, a counter and a label strip."""
-    clicked = Signal()
+    """Compact transport strip: reels (spin only while cutting), a status display, a VU meter."""
 
     def __init__(self, metal):
         super().__init__()
         self.metal = metal
-        self.setMinimumHeight(300)
-        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(150)
         self.angle = 0.0
-        self.speed = 0.0          # degrees per frame
-        self.progress = 0.0       # 0 = tape on left reel, 1 = on right reel
+        self.working = False
+        self.progress = 0.0       # target: 0 = tape on the left reel, 1 = all on the right
+        self.shown = 0.0          # what is drawn; eases towards progress
         self.level = -60.0        # VU input in dB
         self.needle = -60.0
-        self.counter = "--:--"
-        self.label = "DROP RECORDINGS HERE"
-        self.hover = False
+        self.title, self.detail, self.play_line = "READY", "Drop recordings to start", ""
+        self.playing = False
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(33)
 
-    def mousePressEvent(self, e):
-        self.clicked.emit()
-
     def tick(self):
-        self.angle = (self.angle + self.speed) % 360
-        # VU ballistics: quick-ish rise, slower fall
-        k = 0.35 if self.level > self.needle else 0.12
+        if self.working:
+            self.angle = (self.angle + 5) % 360
+        self.shown += (self.progress - self.shown) * 0.08
+        k = 0.35 if self.level > self.needle else 0.12      # VU ballistics
         self.needle += (self.level - self.needle) * k
         self.update()
 
-    # -- drawing helpers
     def reel(self, p, c, R, pack):
         p.save()
         p.translate(c)
-        # tape pack
         p.setPen(Qt.NoPen)
         g = QRadialGradient(0, 0, pack)
         g.setColorAt(0.0, QColor("#3a2a1f"))
         g.setColorAt(1.0, QColor("#57402e"))
         p.setBrush(g)
         p.drawEllipse(QPointF(0, 0), pack, pack)
-        # aluminium flange with three windows
         flange = QPainterPath()
         flange.addEllipse(QPointF(0, 0), R, R)
         p.rotate(self.angle)
@@ -305,127 +312,133 @@ class Deck(QWidget):
         g.setColorAt(0.5, QColor("#a9aaa6"))
         g.setColorAt(1, QColor("#e3e3de"))
         p.setBrush(g)
-        p.setPen(QPen(QColor("#6d6d69"), 1.2))
+        p.setPen(QPen(QColor("#6d6d69"), 1))
         p.drawPath(flange)
-        # hub
         p.setBrush(QColor("#2d2b28"))
-        p.drawEllipse(QPointF(0, 0), R * 0.13, R * 0.13)
-        p.setBrush(QColor("#d9d9d4"))
-        for k in range(3):
-            a = math.radians(k * 120)
-            p.drawRect(QRectF(math.cos(a) * R * 0.1 - 2, math.sin(a) * R * 0.1 - 2, 4, 4))
+        p.drawEllipse(QPointF(0, 0), R * 0.14, R * 0.14)
         p.restore()
 
     def vu(self, p, r):
         p.save()
-        p.setPen(QPen(QColor("#1b1814"), 3))
+        p.setPen(QPen(QColor("#1b1814"), 2))
         p.setBrush(QColor("#151210"))
-        p.drawRoundedRect(r.adjusted(-6, -6, 6, 6), 8, 8)
+        p.drawRoundedRect(r.adjusted(-5, -5, 5, 5), 6, 6)
         g = QLinearGradient(r.topLeft(), r.bottomLeft())
         g.setColorAt(0, QColor("#fff3cf"))
         g.setColorAt(1, QColor("#f0d48e"))
         p.setBrush(g)
         p.setPen(Qt.NoPen)
-        p.drawRoundedRect(r, 4, 4)
+        p.drawRoundedRect(r, 3, 3)
         cx, cy = r.center().x(), r.bottom() + r.height() * 0.12
         rad = r.height() * 0.92
-        scale = [-20, -10, -7, -5, -3, -2, -1, 0, 1, 2, 3]
 
         def ang(db):
-            t = (max(-20, min(3, db)) + 20) / 23
-            t = t ** 1.6                                     # VU-ish spacing, crowded at the bottom
+            t = ((max(-20, min(3, db)) + 20) / 23) ** 1.6     # VU-ish spacing
             return math.radians(-138 + t * 96)
 
-        p.setFont(QFont(LABEL, 7))
-        for db in scale:
+        p.setFont(QFont(LABEL, 6))
+        for db in [-20, -10, -7, -5, -3, -2, -1, 0, 1, 2, 3]:
             a = ang(db)
-            col = QColor(RED) if db >= 0 else QColor(INK)
-            p.setPen(QPen(col, 1.6))
-            p1 = QPointF(cx + math.cos(a) * rad * 0.78, cy + math.sin(a) * rad * 0.78)
-            p2 = QPointF(cx + math.cos(a) * rad * 0.86, cy + math.sin(a) * rad * 0.86)
-            p.drawLine(p1, p2)
+            p.setPen(QPen(QColor(RED) if db >= 0 else QColor(INK), 1.3))
+            p.drawLine(QPointF(cx + math.cos(a) * rad * 0.78, cy + math.sin(a) * rad * 0.78),
+                       QPointF(cx + math.cos(a) * rad * 0.86, cy + math.sin(a) * rad * 0.86))
             if db in (-20, -10, -5, 0, 3):
                 t = QPointF(cx + math.cos(a) * rad * 0.97, cy + math.sin(a) * rad * 0.97)
-                p.drawText(QRectF(t.x() - 12, t.y() - 7, 24, 12), Qt.AlignCenter, f"{db:+d}" if db else "0")
-        p.setPen(QPen(QColor(RED), 3))
-        p.drawArc(QRectF(cx - rad * 0.82, cy - rad * 0.82, rad * 1.64, rad * 1.64),
-                  int(-math.degrees(ang(0)) * 16), int(-(math.degrees(ang(3)) - math.degrees(ang(0))) * 16))
+                p.drawText(QRectF(t.x() - 10, t.y() - 6, 20, 11), Qt.AlignCenter, f"{db:+d}" if db else "0")
         p.setPen(QColor(INK))
-        p.setFont(QFont(LABEL, 11, QFont.Bold))
-        p.drawText(QRectF(r.left(), r.bottom() - 24, r.width(), 18), Qt.AlignCenter, "VU")
-        a = ang(self.needle + 18)                                # -18 dBFS reads 0 VU
-        p.setPen(QPen(QColor("#1d1a17"), 2))
+        p.setFont(QFont(LABEL, 8, QFont.Bold))
+        p.drawText(QRectF(r.left(), r.bottom() - 17, r.width(), 14), Qt.AlignCenter, "VU")
+        a = ang(self.needle + 18)                            # -18 dBFS reads 0 VU
+        p.setPen(QPen(QColor("#1d1a17"), 1.6))
         p.setClipRect(r)
         p.drawLine(QPointF(cx, cy), QPointF(cx + math.cos(a) * rad * 0.88, cy + math.sin(a) * rad * 0.88))
         p.restore()
+
+    def lamp(self, p, c, on, color):
+        g = QRadialGradient(c, 7)
+        g.setColorAt(0, QColor(color) if on else QColor("#3a332b"))
+        g.setColorAt(1, QColor(color).darker(260) if on else QColor("#1d1915"))
+        p.setPen(Qt.NoPen)
+        p.setBrush(g)
+        p.drawEllipse(c, 5, 5)
 
     def paintEvent(self, e):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
-        # black faceplate inset in the aluminium
-        face = QRectF(14, 10, w - 28, h - 20)
+        face = QRectF(6, 4, w - 12, h - 8)
         p.setPen(QPen(QColor("#8d8d88"), 1))
         p.setBrush(QColor("#1f1c19"))
-        p.drawRoundedRect(face, 10, 10)
-        inner = face.adjusted(8, 8, -8, -8)
+        p.drawRoundedRect(face, 9, 9)
+        inner = face.adjusted(6, 6, -6, -6)
         p.drawTiledPixmap(inner, self.metal)
-        p.setPen(QPen(QColor(0, 0, 0, 60), 1))
-        p.setBrush(Qt.NoBrush)
-        p.drawRoundedRect(inner, 6, 6)
 
-        R = min(inner.height() * 0.40, inner.width() * 0.17)
-        cy = inner.top() + R + 14
-        lc = QPointF(inner.left() + R + 22, cy)
-        rc = QPointF(inner.right() - R - 22, cy)
+        # engraved model plate
+        p.setPen(QColor(INK))
+        f = QFont(LABEL, 10, QFont.Bold)
+        f.setLetterSpacing(QFont.AbsoluteSpacing, 4)
+        p.setFont(f)
+        p.drawText(QRectF(inner.left() + 14, inner.top() + 4, 200, 16), Qt.AlignLeft, "REEL CUT")
+        p.setPen(QColor("#5f5b54"))
+        p.setFont(QFont(LABEL, 7))
+        p.drawText(QRectF(inner.left() + 110, inner.top() + 6, 200, 14), Qt.AlignLeft, "MODEL RC-1")
+
+        # reels
+        R = min(42.0, (inner.height() - 34) / 2)
+        cy = inner.center().y() + 9
+        lc = QPointF(inner.left() + 18 + R, cy)
+        rc = QPointF(lc.x() + 2 * R + 16, cy)
         full, empty = R * 0.82, R * 0.36
-        lp = full - (full - empty) * self.progress
-        rp = empty + (full - empty) * self.progress
-        # tape path past the head block
-        head = QRectF(w / 2 - 34, inner.bottom() - 62, 68, 30)
-        p.setPen(QPen(QColor("#4a3626"), 3))
-        p.drawLine(QPointF(lc.x(), lc.y() + lp), QPointF(head.left() + 6, head.top() + 4))
-        p.drawLine(QPointF(head.left() + 6, head.top() + 4), QPointF(head.right() - 6, head.top() + 4))
-        p.drawLine(QPointF(head.right() - 6, head.top() + 4), QPointF(rc.x(), rc.y() + rp))
-        g = QLinearGradient(head.topLeft(), head.bottomLeft())
-        g.setColorAt(0, QColor("#55524c"))
-        g.setColorAt(1, QColor("#25231f"))
-        p.setPen(QPen(QColor("#111"), 1))
-        p.setBrush(g)
-        p.drawRoundedRect(head, 4, 4)
+        lp = full - (full - empty) * self.shown
+        rp = empty + (full - empty) * self.shown
+        p.setPen(QPen(QColor("#4a3626"), 2))
+        p.drawLine(QPointF(lc.x(), cy + lp), QPointF(rc.x(), cy + rp))
         self.reel(p, lc, R, lp)
         self.reel(p, rc, R, rp)
 
-        # VU meter and counter in the middle
-        vw = min(190, inner.width() - 4 * R - 110)
-        vu = QRectF(w / 2 - vw / 2, inner.top() + 18, vw, vw * 0.58)
+        # VU meter
+        vw, vh = 118.0, 68.0
+        vu = QRectF(inner.right() - 16 - vw, cy - vh / 2, vw, vh)
         self.vu(p, vu)
-        cnt = QRectF(w / 2 - 54, vu.bottom() + 16, 108, 30)
-        p.setPen(QPen(QColor("#0c0b0a"), 2))
-        p.setBrush(QColor("#1a1612"))
-        p.drawRoundedRect(cnt, 4, 4)
-        p.setPen(QColor(AMBER))
-        p.setFont(QFont("Consolas", 15, QFont.Bold))
-        p.drawText(cnt, Qt.AlignCenter, self.counter)
-        lamp = QPointF(cnt.right() + 16, cnt.center().y())
-        on = self.speed != 0
-        p.setPen(Qt.NoPen)
-        gl = QRadialGradient(lamp, 9)
-        gl.setColorAt(0, QColor("#ff7a5c" if on else "#5a2420"))
-        gl.setColorAt(1, QColor("#7a1c12" if on else "#2a1210"))
-        p.setBrush(gl)
-        p.drawEllipse(lamp, 6, 6)
 
-        # cream label strip (Dymo-style)
-        strip = QRectF(inner.left() + 24, inner.bottom() - 26, inner.width() - 48, 20)
-        p.setPen(QPen(QColor("#b9ab86"), 1))
-        p.setBrush(QColor(CREAM if not self.hover else "#fff4d6"))
-        p.drawRoundedRect(strip, 3, 3)
-        p.setPen(QColor(INK))
-        f = QFont(LABEL, 9, QFont.DemiBold)
-        f.setLetterSpacing(QFont.AbsoluteSpacing, 2)
+        # status display
+        disp = QRectF(rc.x() + R + 20, inner.top() + 22, vu.left() - 22 - (rc.x() + R + 20), inner.height() - 32)
+        g = QLinearGradient(disp.topLeft(), disp.bottomLeft())
+        g.setColorAt(0, QColor("#1d1915"))
+        g.setColorAt(1, QColor("#2b241d"))
+        p.setPen(QPen(QColor("#0c0b0a"), 2))
+        p.setBrush(g)
+        p.drawRoundedRect(disp, 5, 5)
+        tx = disp.left() + 26
+        tw = disp.width() - 36
+
+        self.lamp(p, QPointF(disp.left() + 13, disp.top() + 18), self.working, AMBER)
+        f = QFont(LABEL, 14, QFont.Bold)
+        f.setLetterSpacing(QFont.AbsoluteSpacing, 3)
         p.setFont(f)
-        p.drawText(strip, Qt.AlignCenter, self.label.upper())
+        p.setPen(QColor(AMBER))
+        p.drawText(QRectF(tx, disp.top() + 6, tw, 24), Qt.AlignLeft | Qt.AlignVCenter, self.title)
+        p.setFont(QFont(LABEL, 10))
+        p.setPen(QColor("#e8c27a"))
+        fm = QFontMetrics(p.font())
+        p.drawText(QRectF(tx, disp.top() + 31, tw, 18), Qt.AlignLeft | Qt.AlignVCenter,
+                   fm.elidedText(self.detail, Qt.ElideRight, int(tw)))
+
+        # progress tape under the job lines
+        bar = QRectF(tx, disp.top() + 53, tw, 3)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#3d342a"))
+        p.drawRect(bar)
+        if self.working:
+            p.setBrush(QColor(AMBER))
+            p.drawRect(QRectF(bar.left(), bar.top(), bar.width() * self.shown, bar.height()))
+
+        self.lamp(p, QPointF(disp.left() + 13, disp.bottom() - 15), self.playing, "#7ddc5a")
+        p.setFont(QFont("Consolas", 10))
+        p.setPen(QColor("#cfe8b8") if self.playing else QColor("#8a7a62"))
+        fm = QFontMetrics(p.font())
+        p.drawText(QRectF(tx, disp.bottom() - 25, tw, 20), Qt.AlignLeft | Qt.AlignVCenter,
+                   fm.elidedText(self.play_line, Qt.ElideRight, int(tw)))
 
 
 # ---------------------------------------------------------------- song list
@@ -508,18 +521,25 @@ class SongRow(QFrame):
         super().__init__()
         self.path, self.env, self.src = Path(path), env, src
         self.start, self.end = start, end
+        self.num = num
+        self.applied = ""                 # the name the file currently carries
         self.setObjectName("songrow")
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(10, 4, 10, 6)
+        lay.setContentsMargins(8, 3, 8, 5)
         n = QLabel(f"{num:02d}")
         n.setObjectName("num")
         self.btn = QPushButton("▶")
         self.btn.setObjectName("play")
-        self.btn.setFixedSize(34, 34)
+        self.btn.setFixedSize(32, 32)
+        self.btn.setToolTip("Listen")
         self.btn.clicked.connect(lambda: self.play.emit(self))
         self.name = QLineEdit()
         self.name.setPlaceholderText(f"Song {num:02d}  (type a name)")
         self.name.editingFinished.connect(lambda: self.renamed.emit(self, self.name.text()))
+        self.name.textEdited.connect(lambda _: self.saved.setText(""))
+        self.saved = QLabel("")
+        self.saved.setObjectName("saved")
+        self.saved.setFixedWidth(16)
         self.dur = QLabel()
         self.dur.setObjectName("dur")
         self.bar = SeekBar()
@@ -533,13 +553,17 @@ class SongRow(QFrame):
         self.b_discard.setToolTip("Discard this take (moves the file to the Recycle Bin)")
         self.b_discard.clicked.connect(lambda: self.discard.emit(self))
         for b in (self.b_recut, self.b_discard):
-            b.setFixedSize(30, 30)
+            b.setFixedSize(28, 28)
             b.setCursor(Qt.PointingHandCursor)
         self.bar.setToolTip("Where to listen from. Click or drag.")
         self.bar.sliderMoved.connect(lambda v: self.seek.emit(self, v / 1000))
+        top = QHBoxLayout()
+        top.setSpacing(4)
+        top.addWidget(self.name, 1)
+        top.addWidget(self.saved)
         mid = QVBoxLayout()
-        mid.setSpacing(2)
-        mid.addWidget(self.name)
+        mid.setSpacing(1)
+        mid.addLayout(top)
         mid.addWidget(self.bar)
         lay.addWidget(n)
         lay.addWidget(self.btn)
@@ -548,11 +572,18 @@ class SongRow(QFrame):
         lay.addWidget(self.b_recut)
         lay.addWidget(self.b_discard)
 
+    @property
+    def title(self):
+        return self.name.text().strip() or f"Song {self.num:02d}"
+
+    def mark_saved(self, ok=True):
+        self.saved.setText("✓" if ok and self.applied else "")
+        self.saved.setToolTip(f"Saved as {self.path.name}" if ok else "")
+
     def set_span(self, start, end, env):
         self.start, self.end, self.env = start, end, env
         self.bar.set_env(env)
-        d = end - start
-        self.dur.setText(f"{int(d // 60)}:{int(d % 60):02d}")
+        self.dur.setText(fmt_time(end - start))
 
     def set_working(self, on):
         for w in (self.btn, self.b_recut, self.b_discard, self.bar):
@@ -566,42 +597,69 @@ class SongRow(QFrame):
 
     def set_playing(self, on):
         self.btn.setText("■" if on else "▶")
+        self.btn.setToolTip("Stop" if on else "Listen")
+        self.setProperty("playing", on)
+        self.style().unpolish(self)
+        self.style().polish(self)
 
     def show_position(self, frac):
         if not self.bar.isSliderDown():
             self.bar.setValue(int(frac * 1000))
 
 
+class DropTarget(QLabel):
+    clicked = Signal()
+
+    def __init__(self):
+        super().__init__("Drop rehearsal or gig recordings here\n\nor click to choose files")
+        self.setObjectName("drop")
+        self.setAlignment(Qt.AlignCenter)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, e):
+        self.clicked.emit()
+
+
 STYLE = f"""
 QMainWindow, QDialog {{ background: #c9c9c4; }}
-QLabel {{ color: {INK}; font-family: {LABEL}; }}
+QLabel {{ color: {INK}; font-family: {LABEL}; background: transparent; }}
 QWidget#sheet {{ background: {CREAM}; border: 1px solid #b9ab86; border-radius: 6px; }}
-QLabel#sheettitle {{ font-size: 12px; letter-spacing: 3px; font-weight: 600; color: #6b5d43; }}
+QLabel#step {{ font-size: 12px; letter-spacing: 2px; color: #7d776a; padding: 4px 2px; }}
+QLabel#step[active="true"] {{ color: {INK}; font-weight: 700; border-bottom: 3px solid {RED}; }}
+QLabel#drop {{ font-size: 17px; color: #7a6a4a; border: 2px dashed #c2b086; border-radius: 10px;
+               margin: 8px; background: #f6edd6; }}
+QLabel#drop:hover {{ background: #fff6df; border-color: {RED}; color: {INK}; }}
 QFrame#songrow {{ border-bottom: 1px solid #d9cba6; }}
-QLabel#rechead {{ font-family: Consolas; font-size: 12px; color: #6b5d43; padding: 10px 4px 2px 4px;
+QFrame#songrow[playing="true"] {{ background: #f8eccc; border-left: 3px solid #5fae3e; }}
+QLabel#rechead {{ font-family: Consolas; font-size: 12px; color: #6b5d43; padding: 8px 4px 2px 4px;
                   border-bottom: 2px solid #b9ab86; }}
-QLabel#num {{ font-family: Consolas; font-size: 15px; color: #8a7a58; min-width: 26px; }}
-QLabel#dur {{ font-family: Consolas; font-size: 13px; color: #6b5d43; }}
+QLabel#num {{ font-family: Consolas; font-size: 14px; color: #8a7a58; min-width: 22px; }}
+QLabel#dur {{ font-family: Consolas; font-size: 13px; color: #6b5d43; min-width: 34px; }}
+QLabel#saved {{ color: #3f8a2a; font-size: 14px; font-weight: 700; }}
 QLineEdit {{ background: transparent; border: none; border-bottom: 1px dashed #b9ab86;
-            font-family: {LABEL}; font-size: 15px; color: {INK}; padding: 4px; }}
+            font-family: {LABEL}; font-size: 14px; color: {INK}; padding: 2px 4px; }}
 QLineEdit:focus {{ border-bottom: 2px solid {RED}; }}
-QPushButton#play {{ border-radius: 17px; font-size: 13px; color: #f4f4f0;
+QPushButton#play {{ border-radius: 16px; font-size: 12px; color: #f4f4f0;
     background: qradialgradient(cx:0.4, cy:0.35, radius:0.8, stop:0 #5a5650, stop:1 #1e1c19);
     border: 2px solid #8d8d88; }}
 QPushButton#play:hover {{ border-color: {AMBER}; }}
-QPushButton#small {{ font-size: 14px; color: #6b5d43; background: transparent;
+QPushButton#play:disabled {{ color: #8d8d88; }}
+QPushButton#small {{ font-size: 13px; color: #6b5d43; background: transparent;
     border: 1px solid #c9b98f; border-radius: 4px; }}
 QPushButton#small:hover {{ color: {RED}; border-color: {RED}; background: #fff6df; }}
 QPushButton#small:disabled {{ color: #cdbf9a; border-color: #e0d3b0; }}
 QPushButton#key {{ font-family: {LABEL}; font-size: 12px; font-weight: 600; letter-spacing: 2px;
-    color: {INK}; padding: 10px 18px; border: 1px solid #7d776a; border-radius: 4px;
+    color: {INK}; padding: 9px 16px; border: 1px solid #7d776a; border-radius: 4px;
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #fbf4e2, stop:1 #ddd0ad); }}
 QPushButton#key:hover {{ background: #fff8e8; }}
-QPushButton#key:pressed {{ background: #cfc19b; padding-top: 12px; }}
-QPushButton#key:disabled {{ color: #9b937f; }}
-QSlider::groove:horizontal {{ height: 4px; background: #d9cba6; border-radius: 2px; }}
-QSlider::sub-page:horizontal {{ background: #6b4a30; border-radius: 2px; }}
-QSlider::handle:horizontal {{ width: 6px; margin: -6px 0; background: {RED}; border-radius: 1px; }}
+QPushButton#key:pressed {{ background: #cfc19b; }}
+QPushButton#key:disabled {{ color: #a39b86; }}
+QPushButton#primary {{ font-family: {LABEL}; font-size: 13px; font-weight: 700; letter-spacing: 3px;
+    color: #fff4e0; padding: 9px 26px; border: 1px solid #6e1d15; border-radius: 4px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #cf4a3b, stop:1 #9b2a1f); }}
+QPushButton#primary:hover {{ background: #d9564a; }}
+QPushButton#primary:disabled {{ color: #e6c9c2; background: #c49a92; border-color: #a5817a; }}
+QSlider::groove:horizontal {{ height: 4px; background: #d9cba6; }}
 QScrollArea, QScrollArea > QWidget > QWidget, QWidget#listbox {{ border: none; background: transparent; }}
 QDialog QLabel, QDialog QCheckBox {{ font-size: 13px; }}
 """
@@ -612,13 +670,17 @@ class Main(QMainWindow):
         super().__init__()
         self.setWindowTitle(APP)
         self.setAcceptDrops(True)
-        self.resize(820, 760)
-        self.setMinimumSize(700, 620)
+        self.resize(780, 640)
+        self.setMinimumSize(640, 500)
         self.st = Settings()
         self.worker = None
+        self.job = None               # what the worker is doing now
         self.rows = []
         self.current = None           # SongRow being played
         self.pending = {}             # row -> name waiting for playback to stop
+        self.recuts = set()
+        self.note, self.note_until = "", 0.0
+        self.finished = False         # after DONE, until the next drop
         self.metal = brushed_metal()
 
         self.player = QMediaPlayer(self)
@@ -627,94 +689,148 @@ class Main(QMainWindow):
         self.player.positionChanged.connect(self.on_position)
         self.player.mediaStatusChanged.connect(self.on_media_status)
         self.seek_to = None
-        self.recuts = set()
 
         c = QWidget()
         self.setCentralWidget(c)
         lay = QVBoxLayout(c)
-        lay.setContentsMargins(34, 16, 34, 18)
-        lay.setSpacing(12)
-
-        top = QHBoxLayout()
-        title = QLabel("REEL CUT")
-        title.setStyleSheet(f"font-family:{LABEL}; font-size:24px; font-weight:700; letter-spacing:8px; color:{INK};")
-        sub = QLabel("rehearsal splitter  ·  model RC-1")
-        sub.setStyleSheet("font-size:12px; letter-spacing:2px; color:#55524c;")
-        top.addWidget(title)
-        top.addSpacing(14)
-        top.addWidget(sub)
-        top.addStretch(1)
-        lay.addLayout(top)
+        lay.setContentsMargins(26, 10, 26, 14)
+        lay.setSpacing(8)
 
         self.deck = Deck(self.metal)
-        self.deck.clicked.connect(self.choose_files)
-        lay.addWidget(self.deck, 4)
+        lay.addWidget(self.deck)
+
+        steps = QHBoxLayout()
+        steps.setSpacing(18)
+        self.steps = []
+        for i, t in enumerate(["1  DROP RECORDINGS", "2  LISTEN & NAME", "3  DONE"]):
+            s = QLabel(t)
+            s.setObjectName("step")
+            self.steps.append(s)
+            steps.addWidget(s)
+            if i < 2:
+                arrow = QLabel("→")
+                arrow.setStyleSheet("color:#7d776a;")
+                steps.addWidget(arrow)
+        steps.addStretch(1)
+        lay.addLayout(steps)
 
         sheet = QWidget()
         sheet.setObjectName("sheet")
         sl = QVBoxLayout(sheet)
-        sl.setContentsMargins(14, 10, 14, 10)
-        st = QLabel("TRACK SHEET")
-        st.setObjectName("sheettitle")
-        sl.addWidget(st)
+        sl.setContentsMargins(10, 6, 10, 6)
+        self.drop = DropTarget()
+        self.drop.clicked.connect(self.choose_files)
+        sl.addWidget(self.drop, 1)
         self.list_box = QWidget()
+        self.list_box.setObjectName("listbox")
         self.list_lay = QVBoxLayout(self.list_box)
         self.list_lay.setContentsMargins(0, 0, 0, 0)
         self.list_lay.setSpacing(0)
-        self.empty = QLabel("Songs appear here. Press play to hear one, then type its name.")
-        self.empty.setStyleSheet("color:#8a7a58; font-size:13px; padding:12px 4px;")
-        self.list_lay.addWidget(self.empty)
         self.list_lay.addStretch(1)
-        self.list_box.setObjectName("listbox")
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self.list_box)
-        sl.addWidget(scroll)
-        lay.addWidget(sheet, 3)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setWidget(self.list_box)
+        sl.addWidget(self.scroll, 1)
+        lay.addWidget(sheet, 1)
 
         keys = QHBoxLayout()
-        self.k_load = self.key("LOAD", self.choose_files)
-        self.k_clear = self.key("CLEAR LIST", self.clear_list)
-        self.k_clear.setToolTip("Empties the track sheet. Saved songs stay in their folder.")
-        self.k_open = self.key("OPEN FOLDER", self.open_out)
-        self.k_set = self.key("SETTINGS", self.settings)
-        keys.addWidget(self.k_load)
-        keys.addWidget(self.k_clear)
+        self.k_add = self.key("+ ADD", self.choose_files, "Add more recordings")
+        self.k_set = self.key("SETTINGS", self.settings, "Save folder, file format, song detection, sound")
+        self.k_open = self.key("OPEN FOLDER", self.open_out, "Open the folder where the songs are saved")
+        self.k_done = self.key("DONE  ✓", self.done, "Save all names, open the folder and clear the list", "primary")
+        keys.addWidget(self.k_add)
+        keys.addWidget(self.k_set)
         keys.addStretch(1)
         keys.addWidget(self.k_open)
-        keys.addWidget(self.k_set)
+        keys.addWidget(self.k_done)
         lay.addLayout(keys)
-        self.last_folder = None
 
-    def key(self, text, fn):
+        self.ui_timer = QTimer(self)
+        self.ui_timer.timeout.connect(self.refresh)
+        self.ui_timer.start(200)
+        self.refresh()
+
+    def key(self, text, fn, tip, name="key"):
         b = QPushButton(text)
-        b.setObjectName("key")
+        b.setObjectName(name)
         b.setCursor(Qt.PointingHandCursor)
+        b.setToolTip(tip)
         b.clicked.connect(fn)
         return b
 
     def paintEvent(self, e):
         p = QPainter(self)
         p.drawTiledPixmap(self.rect(), self.metal)
-        # walnut side cheeks
-        for x in (0, self.width() - 18):
-            g = QLinearGradient(x, 0, x + 18, 0)
+        for x in (0, self.width() - 14):                 # walnut side cheeks
+            g = QLinearGradient(x, 0, x + 14, 0)
             g.setColorAt(0, QColor("#3b2414"))
             g.setColorAt(0.5, QColor("#6a4325"))
             g.setColorAt(1, QColor("#3b2414"))
-            p.fillRect(QRectF(x, 0, 18, self.height()), g)
+            p.fillRect(QRectF(x, 0, 14, self.height()), g)
+
+    # -- status: one place decides what the deck says
+    def say(self, text, seconds=6):
+        self.note, self.note_until = text, time.monotonic() + seconds
+
+    def busy(self):
+        return bool(self.worker and self.worker.isRunning())
+
+    def refresh(self):
+        d = self.deck
+        busy, recutting = self.busy(), bool(self.recuts)
+        d.working = busy or recutting
+        note = self.note if time.monotonic() < self.note_until else ""
+        if busy and self.job:
+            j = self.job
+            total = j["i"] + self.worker.waiting()
+            d.title = f"CUTTING  {j['i']}/{total}" if total > 1 else "CUTTING"
+            what = ("finding songs" if j["parts"] is None
+                    else f"song {min(j['k'] + 1, j['parts'])} of {j['parts']}" if j["parts"]
+                    else "no songs found")
+            d.detail = f"{what}  ·  {Path(j['name']).stem}"
+        elif recutting:
+            d.title = "RECUTTING"
+            d.detail = note or "Making the song wider"
+            d.progress = 0.5
+        elif self.finished:
+            d.title = "DONE"
+            d.detail = note or "Drop the next recordings to start again"
+        elif self.rows:
+            d.title = "READY"
+            d.detail = note or "Listen, type the names, then press DONE"
+        else:
+            d.title = "READY"
+            d.detail = note or "Drop recordings to start"
+        if busy and note and not self.job:
+            d.detail = note
+        if self.current:
+            pos, dur = self.player.position() / 1000, max(0, self.player.duration()) / 1000
+            d.play_line = f"▶  {self.current.title}   {fmt_time(pos)} / {fmt_time(dur)}"
+        else:
+            d.play_line = "Press ▶ on a song to listen" if self.rows else "Nothing to listen to yet"
+        d.playing = bool(self.current)
+
+        has_rows = bool(self.rows)
+        self.drop.setVisible(not has_rows)
+        self.scroll.setVisible(has_rows)
+        step = 3 if self.finished and not has_rows and not busy else (2 if has_rows or busy else 1)
+        for i, s in enumerate(self.steps, 1):
+            if s.property("active") != (i == step):
+                s.setProperty("active", i == step)
+                s.style().unpolish(s)
+                s.style().polish(s)
+        self.k_done.setEnabled(has_rows and not busy and not recutting)
+        self.k_done.setToolTip("Wait until cutting is finished" if busy else
+                               "Save all names, open the folder and clear the list")
+        self.k_set.setEnabled(not busy)
+        self.k_add.setVisible(has_rows or busy)
 
     # -- input
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
             e.acceptProposedAction()
-            self.deck.hover = True
-
-    def dragLeaveEvent(self, e):
-        self.deck.hover = False
 
     def dropEvent(self, e):
-        self.deck.hover = False
         self.start([u.toLocalFile() for u in e.mimeData().urls()])
 
     def choose_files(self):
@@ -727,13 +843,21 @@ class Main(QMainWindow):
     def settings(self):
         SettingsDialog(self.st, self).exec()
 
-    def open_out(self):
-        d = self.last_folder or self.st.out_dir
-        Path(d).mkdir(parents=True, exist_ok=True)
-        os.startfile(d)
+    def folders(self):
+        seen = []
+        for r in self.rows:
+            if r.path.parent not in seen:
+                seen.append(r.path.parent)
+        return seen
 
-    def busy(self):
-        return bool(self.worker and self.worker.isRunning())
+    def open_out(self):
+        folders = self.folders()
+        if len(folders) == 1:
+            os.startfile(folders[0])
+        else:                                        # several recordings: open the parent
+            d = Path(self.st.out_dir)
+            d.mkdir(parents=True, exist_ok=True)
+            os.startfile(d)
 
     # -- processing
     def start(self, paths):
@@ -747,67 +871,49 @@ class Main(QMainWindow):
                 files.append(str(p))
         files = sorted(dict.fromkeys(files))
         if not files:
-            self.deck.label = "That doesn't look like an audio file"
+            self.say("That doesn't look like an audio file")
             return
+        self.finished = False
         if self.worker and self.worker.add(files):
-            self.deck.label = f"Added {len(files)} to the queue"
-            self.show_queue()
+            self.say(f"Added {len(files)} recording{'s' if len(files) > 1 else ''} to the queue")
             return
-        self.deck.progress = 0
-        self.deck.speed = 6
-        self.k_set.setEnabled(False)
-        self.k_clear.setEnabled(False)
+        self.deck.progress = self.deck.shown = 0
+        self.job = None
         self.worker = Worker(files, self.st.out_dir, self.st.options())
-        self.worker.status.connect(self.on_status)
-        self.worker.recording.connect(self.add_header)
+        self.worker.job.connect(self.on_job)
+        self.worker.parts.connect(self.on_parts)
         self.worker.song.connect(self.add_row)
+        self.worker.failed.connect(lambda m: self.say(f"Could not read {m}", 10))
         self.worker.progress.connect(lambda v: setattr(self.deck, "progress", v))
         self.worker.finished_all.connect(self.on_done)
         self.worker.start()
-        self.show_queue()
+        self.refresh()
 
-    def show_queue(self):
-        if not self.current:
-            n = self.worker.waiting() if self.busy() else 0
-            self.deck.counter = f"Q {n:02d}" if n else "-- --"
+    def on_job(self, i, total, name):
+        self.job = {"i": i, "name": name, "parts": None, "k": 0}
+        self.add_header(name)
 
-    def on_status(self, text):
-        self.deck.label = text
-        self.show_queue()
+    def on_parts(self, n):
+        if self.job:
+            self.job["parts"] = n
 
     def on_done(self, count, recordings):
+        self.job = None
         self.deck.progress = 1
-        if not self.current:
-            self.deck.speed = 0
-        self.k_set.setEnabled(True)
-        self.k_clear.setEnabled(True)
-        rec = f" from {recordings} recordings" if recordings > 1 else ""
-        self.deck.label = (f"{count} song{'s' if count != 1 else ''} ready{rec}. Play, name, done."
-                           if count else "No songs found. Try a shorter song length in Settings")
-        if not self.current:
-            self.deck.counter = f"{len(self.rows):02d} SONGS"
-
-    def clear_list(self):
-        if self.busy():
-            return
-        self.stop_playback()
-        while self.list_lay.count() > 2:         # keep the 'empty' hint and the stretch
-            self.list_lay.takeAt(1).widget().setParent(None)
-        self.rows = []
-        self.pending = {}
-        self.empty.show()
-        self.deck.counter = "--:--"
-        self.deck.progress = 0
-        self.deck.label = "Drop recordings here"
+        if count:
+            self.say(f"{count} song{'s' if count != 1 else ''} cut. Listen, name them, press DONE", 15)
+        else:
+            self.say("No songs found. Try a shorter 'Shortest song' in Settings", 15)
+        self.refresh()
 
     def add_header(self, name):
-        self.empty.hide()
         h = QLabel(Path(name).stem)
         h.setObjectName("rechead")
         self.list_lay.insertWidget(self.list_lay.count() - 1, h)
 
     def add_row(self, path, s, e, env, src):
-        self.empty.hide()
+        if self.job:
+            self.job["k"] += 1
         stem = Path(path).stem
         num = int(stem.split(" ")[1]) if stem.startswith("Song ") else len(self.rows) + 1
         row = SongRow(num, path, s, e, env, src)
@@ -818,53 +924,48 @@ class Main(QMainWindow):
         row.discard.connect(self.discard)
         self.rows.append(row)
         self.list_lay.insertWidget(self.list_lay.count() - 1, row)
-        self.last_folder = str(Path(path).parent)
+        self.refresh()
 
-    # -- fixing takes
-    def release(self, row):
-        """Stop playback of this row and apply its pending rename, so the file is free."""
-        if row is self.current:
-            self.stop_playback()
+    def clear_list(self):
+        while self.list_lay.count() > 1:         # keep the stretch
+            self.list_lay.takeAt(0).widget().setParent(None)
+        self.rows = []
+        self.pending = {}
+        self.deck.progress = 0
 
-    def recut(self, row):
-        self.release(row)
-        row.set_working(True)
-        self.deck.label = f"Recutting {row.path.stem} wider"
-        w = RecutWorker(row, self.st.options())
-        w.done.connect(self.on_recut)
-        self.recuts.add(w)                  # keep a reference until it finishes
-        w.finished.connect(lambda: self.recuts.discard(w))
-        w.start()
+    # -- done
+    def commit_names(self):
+        """Apply every typed name, also one still being typed (no Enter pressed)."""
+        self.stop_playback()
+        for r in self.rows:
+            if r.name.text().strip() != r.applied:
+                self.rename(r, r.name.text())
 
-    def on_recut(self, row, s, e, env, err):
-        if row not in self.rows:            # discarded or cleared meanwhile
+    def done(self):
+        if self.busy() or not self.rows:
             return
-        grew = (row.start - s) + (e - row.end)
-        row.set_span(s, e, env)
-        row.set_working(False)
-        row.bar.setValue(int(START_AT * 1000))
-        if err:
-            self.deck.label = f"Recut failed: {err[:60]}"
-        else:
-            self.deck.label = f"{row.path.stem}: {grew:.0f} s more. Press ⟷ again for more"
-
-    def discard(self, row):
-        self.release(row)
-        self.pending.pop(row, None)
-        if row.path.exists() and not QFile.moveToTrash(str(row.path)):
-            QMessageBox.warning(self, APP, f"Could not move {row.path.name} to the Recycle Bin.")
-            return
-        self.rows.remove(row)
-        row.setParent(None)
-        self.deck.label = f"{row.path.stem} moved to the Recycle Bin"
+        self.commit_names()
+        folders, n = self.folders(), len(self.rows)
+        for d in folders[:3]:
+            os.startfile(d)
+        self.clear_list()
+        self.finished = True
+        where = folders[0].name if len(folders) == 1 else f"{len(folders)} folders"
+        self.say(f"{n} song{'s' if n != 1 else ''} saved in {where}. Drop the next recordings", 30)
+        self.refresh()
 
     # -- naming
     def rename(self, row, title):
+        title = title.strip()
+        if title == row.applied:
+            return
         if row is self.current:
             self.pending[row] = title        # the player holds the file open; rename when it stops
             return
         try:
             row.path = core.rename_song(row.path, title)
+            row.applied = title
+            row.mark_saved()
         except FileExistsError as e:
             QMessageBox.warning(self, APP, f"A song called '{e}' already exists in this folder.")
         except OSError as e:
@@ -876,7 +977,41 @@ class Main(QMainWindow):
                 del self.pending[row]
                 self.rename(row, title)
 
-    # -- playback
+    # -- fixing takes
+    def recut(self, row):
+        if row is self.current:
+            self.stop_playback()
+        row.set_working(True)
+        w = RecutWorker(row, self.st.options())
+        w.done.connect(self.on_recut)
+        self.recuts.add(w)                  # keep a reference until it finishes
+        w.finished.connect(lambda: self.recuts.discard(w))
+        w.start()
+        self.say(f"Recutting {row.title} wider", 30)
+
+    def on_recut(self, row, s, e, env, err):
+        if row not in self.rows:            # discarded or cleared meanwhile
+            return
+        grew = (row.start - s) + (e - row.end)
+        row.set_span(s, e, env)
+        row.set_working(False)
+        row.bar.setValue(int(START_AT * 1000))
+        self.say(f"Recut failed: {err[:60]}" if err else
+                 f"{row.title}: {grew:.0f} s added. Press ⟷ again for more")
+
+    def discard(self, row):
+        if row is self.current:
+            self.stop_playback()
+        self.pending.pop(row, None)
+        if row.path.exists() and not QFile.moveToTrash(str(row.path)):
+            QMessageBox.warning(self, APP, f"Could not move {row.path.name} to the Recycle Bin.")
+            return
+        self.rows.remove(row)
+        row.setParent(None)
+        self.say(f"{row.title} moved to the Recycle Bin")
+        self.refresh()
+
+    # -- playback (never moves the reels: they only show cutting)
     def toggle_play(self, row):
         was = self.current
         self.stop_playback()
@@ -887,12 +1022,11 @@ class Main(QMainWindow):
         self.seek_to = row.start_frac      # applied on the first position update, once playing
         self.player.setSource(QUrl.fromLocalFile(str(row.path)))
         self.player.play()
-        self.deck.speed = 2.5
+        self.refresh()
 
     def seek(self, row, frac):
         if row is self.current and self.player.duration() > 0:
             self.player.setPosition(int(frac * self.player.duration()))
-
 
     def stop_playback(self):
         if self.current:
@@ -902,19 +1036,11 @@ class Main(QMainWindow):
         self.player.stop()
         self.player.setSource(QUrl())
         self.deck.level = -60
-        if not self.busy():
-            self.deck.speed = 0
         self.flush_pending()
 
     def on_position(self, ms):
         if not self.current:
             return
-        s = ms / 1000
-        self.deck.counter = f"{int(s // 60):02d}:{int(s % 60):02d}"
-        env = self.current.env
-        i = int(s * 2)
-        if env is not None and 0 <= i < len(env):
-            self.deck.level = float(env[i])
         dur = self.player.duration()
         if dur > 0 and self.seek_to is not None:
             self.player.setPosition(int(self.seek_to * dur))
@@ -922,8 +1048,10 @@ class Main(QMainWindow):
             return
         if dur > 0:
             self.current.show_position(ms / dur)
-            if not self.busy():
-                self.deck.progress = ms / dur
+        env = self.current.env
+        i = int(ms / 500)
+        if env is not None and 0 <= i < len(env):
+            self.deck.level = float(env[i])
 
     def on_media_status(self, status):
         if status == QMediaPlayer.EndOfMedia:
@@ -932,7 +1060,7 @@ class Main(QMainWindow):
             self.stop_playback()
 
     def closeEvent(self, e):
-        self.stop_playback()
+        self.commit_names()                # a name typed without Enter is still saved
         if self.busy():
             self.worker.wait(2000)
         super().closeEvent(e)
